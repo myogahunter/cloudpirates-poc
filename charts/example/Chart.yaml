@@ -1,0 +1,9 @@
+apiVersion: v2
+name: example
+description: An example Helm chart for testing
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: cloudpirates
+    email: info@cloudpirates.io
