@@ -1,0 +1,117 @@
+name: "Pull Request"
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.list-changed.outputs.changed }}
+      changedCharts: ${{ steps.list-changed.outputs.changedCharts }}
+    steps:
+      - name: Setup Helm
+        uses: Azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+
+      - name: Checkout pull request branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+          fetch-depth: 0
+
+      - name: Fetch upstream main branch
+        run: |
+          git remote set-url origin https://github.com/sonnet-tools/cloudpirates-poc.git
+          git fetch origin ${{ github.event.repository.default_branch }}
+          git remote add fork https://github.com/${{ github.event.pull_request.head.repo.full_name }}.git || true
+          git fetch fork ${{ github.head_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+
+      - name: Set up chart-testing-action
+        uses: helm/chart-testing-action@v2.8.0
+
+      - name: Get changed charts
+        id: list-changed
+        run: |
+          changed=$(ct list-changed --target-branch ${{ github.event.repository.default_branch }})
+          if [[ -n "$changed" ]]; then
+            echo "Changed charts:"
+            echo "$changed"
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo 'changedCharts<<EOF' >> $GITHUB_OUTPUT
+            echo $changed >> $GITHUB_OUTPUT
+            echo 'EOF' >> $GITHUB_OUTPUT
+          else
+            echo "No chart changes detected"
+          fi
+
+      - name: Run chart testing (lint)
+        if: steps.list-changed.outputs.changed == 'true'
+        run: |
+          ct lint --target-branch ${{ github.event.repository.default_branch }} --validate-maintainers=false
+
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    needs: [lint-test]
+    if: needs.lint-test.outputs.changed == 'true'
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: Azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+
+      - name: Login to Docker Hub to avoid rate limits
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: helm-chart-test
+          wait: 300s
+
+      - name: Run integration tests
+        env:
+          CHANGED_CHARTS: ${{ needs.lint-test.outputs.changedCharts }}
+        run: |
+          chmod +x ./test-charts.sh
+
+          for chart_directory in ${CHANGED_CHARTS}; do
+            CHART_NAME=${chart_directory#charts/}
+            echo "Testing chart: $CHART_NAME"
+
+            if [ -f "${chart_directory}/.disable-unittest" ]; then
+              echo "Skipping integration test for $CHART_NAME"
+              continue
+            fi
+
+            ./test-charts.sh "$CHART_NAME" --no-cleanup
+          done
